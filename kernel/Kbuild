@@ -1,0 +1,4 @@
+obj-m += pmmap.o
+pmmap-y := super.o bmap.o inode.o alloc.o meta.o common.o ctl.o
+
+

@@ -1,0 +1,10 @@
+config PMMAP_FS
+	depends on X86_64
+	tristate "Pmem Map filesystem support"
+	help
+	  PMmap is a specific filesystem for fsdax mode of nvdimm.
+
+	  To compile this file system support as a module, choose M here: the
+	  module will be called pmmap.
+
+	  If unsure, say N.

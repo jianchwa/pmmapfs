@@ -1,0 +1,184 @@
+Pmmapfs, Pmem mmap Filesystem, is light-weight fs which is specific for
+persistent memory and the case of large files (GiBs) + mmap + userland
+storage engine. It provides better supporting for 1G huge page and more
+flexible adjusting space for large files senarios.
+
+Right now, it only support 5.4, 5.10 and 5.15 LTS.
+
+If you want to try it, you can do as following:
+
+pmmap.mkfs --bdev pmem0
+mount -t pmmapfs /dev/pmem0 /mnt/test
+
+The pud fault is partially supported by pmmapfs, if you want to try it
+use -o pud. By default, it is aligned with fsdax which is up to pmd size.
+
+Block Allocation
+================
+To try best to support huge page, pmmapfs maintains the blocks in 3 levels,
+pud (1G), pmd (2M) and pte (4K). For example, when we allocate a 4K block,
+layout changes as following,
+
+            (pud chk id).(pmd chk id).(pte blk id)
+            +-----------------------------------------------------+
+            | pud level : chk 0, chk1, achk2, chk3                |
+            | pmd level : 0                                       |
+            | pte level : 0                                       |
+            |                  ||                                 |
+            |                  \/                                 |
+            | (get chk 0 and charge it to pmd level)              |
+            | pud level : chk 1, chk 2, chk3                      |
+            | pmd level : chk 0   {chk 0.0, chk 0.1 ... chk 0.511}|
+            | pte level : 0                                       |
+            |                  ||                                 |
+            |                  \/                                 |
+            | (get chk 0.0 and charge it to pte level)            |
+            | pud level : chk 1, chk 2, chk3                      |
+            | pmd level : chk 0   {chk 0.1, chk 0.2 ... chk 0.511}|
+            | pte level : chk 0.0 {blk 0.0.0 ... blk 0.0.511      |
+            |                  ||                                 |
+            |                  \/                                 |
+            | (get chk blk 0.0.0)                                 |
+            | pud level : chk 1, chk 2, chk3                      |
+            | pmd level : chk 0   {chk 0.1, chk 0.2 ... chk 0.511}|
+            | pte level : chk 0.0 {blk 0.0.1 ... blk 0.0.511      |
+            +-----------------------------------------------------+
+
+If we want to allcate a 4K block again, we can get it from pte level
+directly. If we allocate a 1G chunk, just need to pick a chunk up from
+the pud level directly.
+
+            +-----------------------------------------------------+
+            | pud level : chk 1, chk 2, chk3                      |
+            | pmd level : chk 0.1, chk 0.2 ... chk 0.511          |
+            | pte level : blk 0.0.1, chk 0.0.2 ... chk 0.0.511    |
+            |                 ||                                  |
+            |                 \/                                  |
+            | (get chk 0)                                         |
+            | pud level : chk 2, chk3                             |
+            | pmd level : chk 0   {chk 0.1, chk 0.2 ... chk 0.511}|
+            | pte level : chk 0.1 {blk 0.0.1 ... blk 0.0.511      |
+            +-----------------------------------------------------+
+
+To allocate a full chunk, we need to __TRUNCATE__ the file before we
+access it. We don't support pre-allocation when append write, because
+it will break the full chunks and introduce fragments.
+
+The freeing of block is similar but reverse. When a chunk is filled
+full, it will be freed to uppper level to construct bigger full chunk.
+
+Durability
+==========
+Pmmapfs is a low-weight filesystem and developped from tmpfs + dax,
+durability is a later addition and configurable. So a specific method
+to support durablity is taken, full fs metadata snapshot + intend log.
+
+Full fs metadata contains all of information of inodes, bmap, dentries and
+symbol link and is loaded when mount to reconstruct the fs. And oberviously
+it is not sensible to do full sync every time when the metadata is modified.
+So the intend log is introduced to record the modification to very specific
+inode. When log area is full, a full sync is triggered and the previous log
+is discarded.
+
+   full fs meta          intend long               view after mount
+    +--------+     +-------------------------+        +--------+
+    | file_a |     | unlink file_a           |        | file_d |
+    | file_b |  +  | rename file_b to file_d |    =   | dir_c  |
+    | dir_c  |     | create file_e           |        | file_e |
+    +--------+     +-------------------------+        +--------+
+
+We have two places to carry the fs metadata to avoid skew up the metadata
+if system crash during sync process.
+
+       +---------+   +-----+              +---------+
+   =>  | fs meta | + | log |              | fs meta |
+       +---------+   +-----+    SYNC      +---------+
+       +---------+                        +---------+
+       | fs meta |                     => | fs meta |
+       +---------+                        +---------+         
+
+Right now, we have two kinds of metadata snapshot + intend log
+ - filesystem
+   carry the metadata of the filesystem and is stored in special
+   files in .admin directory
+   .admin/
+   ├── f64c1c05ac710417
+   │   ├── 0
+   │   ├── 1
+   │   ├── 2
+   │   ├── 3
+   │   ├── 4
+   │   ├── 5
+   │   ├── 6
+   │   └── 7
+   └── f64c1c05ac710418
+       ├── 0
+       ├── 1
+       ├── 2
+       ├── 3
+       ├── 4
+       ├── 5
+       ├── 6
+       └── 7
+   (multiple metadata files is for multiple-thread sync)
+ - admin
+   carry the metadata of the special files above and is stored in
+   reserved space
+
+        admin   admin   admin
+    sb0  log    meta0   meta1    sb1     fs log
+   |--||-----||-------||-------||--||||------------||
+   \________________ _________________/
+                    v
+                 meta_len
+ 
+
+And you may have found it, when durablity is enabled, pmmapfs is not good at
+massive small files and metadata sensitive cases. The full sync of metadata
+will become a disaster. As we said in the beginning, pmmapfs is specific for
+the case large files (GiBs) + mmap + userland storage engine. In tis case,
+there will not be too many files and most of the file are composed of 1G/2M
+chunks. The amount of metadata is relatively small.
+
+Mount:
+======
+There are two critical steps during mount,
+
+(1) LOAD:
+Load the metadata of
+ - regular files and their bmaps
+ - directory files and their dentries
+ - symlink files and their symbol
+
+When a file's inode is loaded before its parent, don't know its dentry, so
+we construct a dentry with inode number as name and lost+found as parent.
+When the file's parent is loaded and we get its dentry, move the inode back.
+
+When a file's parent is loaded before its inode, we create an empty inode.
+When we get the metadata of file's inode, fill the empty inode with it.
+When the load step complete, the empty inodes will be discarded.
+
+The load process could be deemed as fsck. crc32 is checked for every metadata
+page and corrupted ones will be get rid of. In lost+found, we can find the
+files and directories that lose their parent. After adapt them manually, trigger
+a full sync with 'echo 1 > /sys/fs/pmmap/pmemX/sync' will repair the tree.
+
+(2) REPLAY
+The intend log replay is relatively simple. Just one thing need to be noted,
+when the log is courrpted, we will continue the replay process. This may cause
+issue such as, blocks that need to be reserved cannot be freed by skipped
+corrupted log. But we should replay the log as much as possible.
+
+Non-Durable mode
+================
+Pmmapfs supports non-durable mode. At the moment, pmmapfs is a tmpfs that's
+support access pmem with dax mode. And if the pmem is simulated through
+'memmap=x!x', pmmapfs can be used to manage system huge pages.
+
+TODO
+========
+(1) Right now, pud fault is only partially supported in pmmapfs in an out of
+    tree way, it can only setup pud size mapping, but cannot do write-protect
+	fault on it. The best way is to make fs/dax.c support pud size fault.
+(2) Symbol link that's longer than 128 has not been supported
+(3) Support multiple-thread meta load
