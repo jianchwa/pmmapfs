@@ -2,8 +2,11 @@
 
 #ifndef __PMMAP_CTL_H
 #define __PMMAP_CTL_H
+
+#ifdef __KERNEL__
 #include <linux/types.h>
 #include <linux/ioctl.h>
+#endif
 
 /*
  * This file should be moved to include/uapi/linux/

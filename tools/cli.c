@@ -11,30 +11,30 @@
 #include <linux/types.h>
 #include <sys/ioctl.h>
 
-/*
- * Copied from fs/pmmap/ctl.h
- */
-#define PMMAP_IOCTL_MAGIC 0x80
-
-struct pmmap_ioc_mkfs {
-	char bdev_name[32];
-	__u64 bg_size;
-	__u32 log_len;
-};
-
-#define PMMAP_IOC_MKFS _IOW(PMMAP_IOCTL_MAGIC, 1, struct pmmap_ioc_mkfs)
+#include "../kernel/ctl.h"
 
 #define INFO(fmt, ...) fprintf(stdout, "%s: " fmt, __func__, ##__VA_ARGS__)
 #define ERR(fmt, ...) fprintf(stderr, "%s: " fmt, __func__, ##__VA_ARGS__)
 
+enum pmmap_cli_type {
+	PMMAP_CLI_MKFS,
+	PMMAP_CLI_MAX,
+};
+
 struct {
-	const char *bdev_name;
-	unsigned long bg_size;
-	unsigned log_len;
+	enum pmmap_cli_type type;
+	union {
+		struct {
+			const char *bdev_name;
+			long bg_size;
+			int log_len;
+		} mkfs;
+	};
 } Conf;
 
 enum {
 	OP_HELP = 0,
+	OP_CMD,
 	OP_BDEVNAME,
 	OP_BG_SIZE,
 	OP_LOG_LEN,
@@ -43,24 +43,20 @@ enum {
 
 static char *options_help[OP_MAX] = {
 	"Show help page",
-	"Device name (pmemX)",
-	"Block group size (in GiB, 16 by default)",
-	"Log length ( in MiB, 128 by default)"
+	"Command: mkfs",
+	"mkfs - Device name (pmemX)",
+	"mkfs - Block group size (in GiB, 16 by default)",
+	"mkfs - Log length ( in MiB, 128 by default)"
 };
 
 static struct option long_options[] = {
 	{"help", no_argument, 0, OP_HELP},
+	{"cmd", required_argument, 0, OP_CMD},
 	{"bdev", required_argument, 0, OP_BDEVNAME},
 	{"bgsz", required_argument, 0, OP_BG_SIZE},
 	{"log", required_argument, 0, OP_LOG_LEN},
 	{0, 0, 0, 0},
 };
-
-static void conf_default_init(void)
-{
-	Conf.log_len = 128;
-	Conf.bg_size = 16;
-}
 
 static void help(void)
 {
@@ -76,25 +72,45 @@ static void help(void)
 
 static void parse_options(int argc, char *argv[])
 {
+	enum pmmap_cli_type type;
 	int op;
 
+	Conf.type = type = PMMAP_CLI_MAX;
 	while(1) {
 		op = getopt_long(argc, argv, "", long_options, NULL);
 		if (op == -1)
 			break;
 
-		switch (op) {
-		case OP_HELP:
-			help();
+		switch (type) {
+		case PMMAP_CLI_MAX:
+			switch (op) {
+			case OP_CMD:
+				if (!strcmp(optarg, "mkfs")) {
+					Conf.type = type = PMMAP_CLI_MKFS;
+					Conf.mkfs.log_len = 129;
+					Conf.mkfs.bg_size = 16;
+				}
+				break;
+			default:
+				help();
+				break;
+			}
 			break;
-		case OP_BDEVNAME:
-			Conf.bdev_name = optarg;
-			break;
-		case OP_BG_SIZE:
-			Conf.bg_size = atoi(optarg);
-			break;
-		case OP_LOG_LEN:
-			Conf.log_len = atoi(optarg);
+		case PMMAP_CLI_MKFS:
+			switch (op) {
+			case OP_BDEVNAME:
+				Conf.mkfs.bdev_name = optarg;
+				break;
+			case OP_BG_SIZE:
+				Conf.mkfs.bg_size = atoi(optarg);
+				break;
+			case OP_LOG_LEN:
+				Conf.mkfs.log_len = atoi(optarg);
+				break;
+			default:
+				help();
+				break;
+			}
 			break;
 		default:
 			help();
@@ -136,27 +152,27 @@ static int mkfs_check_sanity(void)
 	int dax;
 	int ret;
 
-	if (!Conf.bdev_name) {
+	if (!Conf.mkfs.bdev_name) {
 		ERR("bdev_name is needed\n");
 		return -EINVAL;
 	}
 
-	ret = get_bdev_dax(Conf.bdev_name, &dax);
+	ret = get_bdev_dax(Conf.mkfs.bdev_name, &dax);
 	if (ret)
 		return ret;
 
 	if (!dax) {
-		ERR("%s doesn't support dax\n", Conf.bdev_name);
+		ERR("%s doesn't support dax\n", Conf.mkfs.bdev_name);
 		return -EINVAL;
 	}
 
-	if (Conf.log_len < 16 || Conf.log_len > 512) {
-		ERR("invalid log len %d\n", Conf.log_len);
+	if (Conf.mkfs.log_len < 16 || Conf.mkfs.log_len > 512) {
+		ERR("invalid log len %d\n", Conf.mkfs.log_len);
 		return -EINVAL;
 	}
 
-	if (Conf.bg_size < 4 || Conf.bg_size > 128){
-		ERR("invalid block group size %ld\n", Conf.bg_size);
+	if (Conf.mkfs.bg_size < 4 || Conf.mkfs.bg_size > 128){
+		ERR("invalid block group size %ld\n", Conf.mkfs.bg_size);
 		return -EINVAL;
 	}
 
@@ -180,10 +196,10 @@ static int do_mkfs(void)
 		return err;
 	}
 
-	sprintf(mkfs.bdev_name, "/dev/%s", Conf.bdev_name);
+	sprintf(mkfs.bdev_name, "/dev/%s", Conf.mkfs.bdev_name);
 
-	mkfs.log_len = Conf.log_len << 20;
-	mkfs.bg_size = Conf.bg_size << 30;
+	mkfs.log_len = Conf.mkfs.log_len << 20;
+	mkfs.bg_size = Conf.mkfs.bg_size << 30;
 
 	err = ioctl(fd, PMMAP_IOC_MKFS, &mkfs);
 	if (err < 0) {
@@ -199,9 +215,16 @@ int main(int argc, char *argv[])
 {
 	int ret;
 
-	conf_default_init();
 	parse_options(argc, argv);
-	ret = do_mkfs();
+
+	switch (Conf.type) {
+	case PMMAP_CLI_MKFS:
+		ret = do_mkfs();
+		break;
+	default:
+		help();
+		break;
+	}
 
 	return ret;
 }
