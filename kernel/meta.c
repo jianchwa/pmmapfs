@@ -390,7 +390,7 @@ static void pmmap_sync_inode(struct pmmap_meta_cursor *mcur,
 	nv_inode.ino = cpu_to_le64(inode->i_ino);
 	nv_inode.mode = cpu_to_le16(inode->i_mode);
 	nv_inode.links_count = cpu_to_le16(inode->i_nlink);
-	nv_inode.flags = cpu_to_le32(inode->i_flags);
+	nv_inode.iflags = cpu_to_le32(inode->i_flags);
 	nv_inode.size = cpu_to_le64(inode->i_size);
 	nv_inode.blocks = cpu_to_le64(inode->i_blocks);
 	nv_inode.uid = cpu_to_le32(i_uid_read(inode));
@@ -709,7 +709,7 @@ static void pmmap_fill_inode_from_meta(struct inode *inode,
 
 	inode->i_ino = le64_to_cpu(nv_inode->ino);
 	inode->i_mode = le16_to_cpu(nv_inode->mode);
-	inode->i_flags = le32_to_cpu(nv_inode->flags);
+	inode->i_flags = le32_to_cpu(nv_inode->iflags);
 	i_uid_write(inode, le32_to_cpu(nv_inode->uid));
 	i_gid_write(inode, le32_to_cpu(nv_inode->gid));
 

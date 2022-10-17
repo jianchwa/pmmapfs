@@ -62,7 +62,7 @@ struct pmmap_nv_inode {
 	__le64 ino;
 	__le16 mode;		/* File mode */
 	__le16 links_count;	/* Links count */
-	__le32 flags;	/* File flags */
+	__le32 iflags;	/* Vfs inode flags */
 	__le64 size;		/* Size in bytes */
 	__le64 blocks;	/* Blocks count */
 	__le32 uid;		/* Owner Uid */
