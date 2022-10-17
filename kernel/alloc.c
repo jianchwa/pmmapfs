@@ -3,6 +3,7 @@
  * Copyright (C) 2020-2021 Wang Jianchao
  */
 #include "pmmap.h"
+#include "ctl.h"
 
 void __rb_insert_chunk(struct rb_root_cached *root,
 		struct pmmap_chunk *chk)
@@ -453,7 +454,7 @@ static bool pmmap_alloc_bg(struct pmmap_alloc_cursor *cur)
 	return true;
 }
 
-bool pmmap_new_blk(struct pmmap_alloc_cursor *cur)
+static bool __pmmap_new_blk(struct pmmap_alloc_cursor *cur)
 {
 	struct pmmap_super *ps = cur->ps;
 	int i, tgt_bg = cur->tgt_bg;
@@ -500,6 +501,133 @@ retry:
 	}
 no_space:
 	return false;
+}
+
+static int __pmmap_adir_charge_blk(struct pmmap_super *ps,
+		struct pmmap_log_cursor *lcur,
+		struct pmmap_adir *adir)
+{
+	struct pmmap_inode *pino = adir->pino;
+	struct pmmap_alloc_cursor cur;
+	struct pmmap_level *level;
+	u64 start_index;
+	int err;
+
+	cur.ps = ps;
+	cur.adir = NULL;
+	cur.tgt_bg = -1;
+
+	cur.order = adir->chunk_order;
+	cur.batch = 1 << cur.order;
+	start_index = adir->nr_chunks << cur.order;
+	/*
+	 * The pmd level need to be fed with pud chunks
+	 */
+	if (cur.order == PMMAP_PUD_ORDER)
+		level = &adir->pmd;
+	else
+		level = &adir->pte;
+
+	/*
+	 * No fallback option for adir
+	 */
+	if (!pmmap_new_blk(&cur)) {
+		err = -ENOSPC;
+		goto out;
+	}
+
+	err = pmmap_charge_chunk(level, cur.res_dblk);
+	if (err) {
+		pmmap_free_blk(ps, cur.order, cur.res_dblk, cur.res_count);
+	} else {
+		/*
+		 * When we remove the directory, its blocks will be truncated
+		 */
+		pmmap_install_blks(pino, start_index,
+				cur.res_dblk, cur.res_count, cur.order);
+		pino->vfs_inode.i_blocks += cur.res_count * BLOCKS_PER_PAGE;
+		adir->nr_chunks++;
+		adir->free_blks += cur.res_count;
+		PDBG("inode %lu charge blk %llx order %d nr_chunks %u\n",
+				pino->vfs_inode.i_ino, cur.res_dblk, cur.order, adir->nr_chunks);
+	}
+
+out:
+	return err;
+}
+
+static int pmmap_adir_charge_blk(struct pmmap_super *ps,
+		struct pmmap_adir *adir)
+{
+	return __pmmap_adir_charge_blk(ps, NULL, adir);
+}
+
+bool pmmap_adir_check_space(struct pmmap_super *ps,
+		struct pmmap_adir *adir, u64 cnt)
+{
+	bool ret = false;
+
+	WARN_ON_ONCE(!mutex_is_locked(&adir->lock));
+	/*
+	 * The allocation cannot cross pmd boundary, so cnt
+	 * must be smaller than pmd chunk size
+	 */
+	if (adir->free_blks >= cnt ||
+	    !pmmap_adir_charge_blk(ps, adir)) {
+		ret = true;
+	}
+
+	PDBG("%llu blks %s free %llu\n", cnt,
+			ret ? "success" : "fail", adir->free_blks);
+	return ret;
+}
+
+static bool pmmap_adir_new_blk(struct pmmap_alloc_cursor *cur)
+{
+	struct pmmap_adir *adir = cur->adir;
+	struct pmmap_alloc_data ad;
+	int err;
+
+	WARN_ON_ONCE(!mutex_is_locked(&adir->lock));
+
+	ad.level = &adir->pte;
+	ad.req_len = cur->batch;
+	err = pmmap_alloc_level(&ad);
+	if (!err) {
+		cur->res_dblk = ad.dblk;
+		cur->res_count = ad.len;
+		cur->err = PMMAP_ALLOC_RES_OK;
+		adir->free_blks -= ad.len;
+	} else {
+		if (err == -ENOSPC)
+			cur->err = PMMAP_ALLOC_RES_NO_SPACE;
+		else
+			cur->err = PMMAP_ALLOC_RES_ERROR;
+	}
+
+	return !err;
+}
+
+static void pmmap_adir_free_blk(struct pmmap_adir *adir, u64 blk, u32 nr)
+{
+	struct pmmap_alloc_data ad;
+
+	ad.level = &adir->pte;
+	ad.dblk = blk;
+	ad.len = nr;
+
+	mutex_lock(&adir->lock);
+	pmmap_free_level(&ad);
+	adir->free_blks += nr;
+	mutex_unlock(&adir->lock);
+}
+
+bool pmmap_new_blk(struct pmmap_alloc_cursor *cur)
+{
+	if (!cur->adir)
+		return __pmmap_new_blk(cur);
+	else
+		return pmmap_adir_new_blk(cur);
 }
 
 static void pmmap_level_init(struct pmmap_super *ps)
@@ -646,6 +774,27 @@ void pmmap_defer_free_finish(struct pmmap_defer_free_cur *dcur)
 	if (!df)
 		return;
 
+	if (dcur->adir) {
+		int i, cnt = df->cnt;
+		for (i = 0; i < df->cnt; i++) {
+			union pmmap_nv_extent *ext = &df->exts[i];
+
+			if (ext->info.order == PMMAP_PTE) {
+				PDBG("%d adir blk %llx order %d len %d\n", i,
+					(u64)ext->info.blk, ext->info.order, ext->info.cnt);
+				pmmap_adir_free_blk(dcur->adir, ext->info.blk, ext->info.cnt);
+				ext->info.order = PMMAP_EMPTY;
+				cnt--;
+			}
+		}
+
+		if (!cnt) {
+			kfree(df);
+			dcur->df = NULL;
+			return;
+		}
+	}
+
 	if (test_bit(PMMAP_SUPER_FLAGS_REPLAY, &ps->flags) || !ps->durable) {
 		/*
 		 * Replay is signle-thread
@@ -713,6 +862,8 @@ again:
 	ext->info.cnt = 1;
 	ext->info.order = de.info.order;
 
+	PDBG("start %dth ext blk %llx order %d\n",
+			df->cnt, (u64)ext->info.blk, ext->info.order);
 	df->cnt++;
 
 	return 0;

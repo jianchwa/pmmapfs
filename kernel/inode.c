@@ -58,6 +58,7 @@ void pmmap_init_inode(struct inode *inode)
 	pino->empty = true;
 	pino->admin = false;
 	pino->flags = 0;
+	pino->adir = NULL;
 	init_rwsem(&pino->mmap_rwsem);
 	init_rwsem(&pino->bmap_rwsem);
 	xa_init(&pino->dax_mapping);
@@ -227,7 +228,7 @@ static struct inode *
 __pmmap_get_inode(struct pmmap_create_inode_data *cd)
 {
 	struct super_block *sb = cd->sb;
-	struct inode *dir = cd->dir;
+	struct pmmap_inode *pdir = PMMAP_I(cd->dir);
 	struct pmmap_super *ps = PMMAP_SB(sb);
 	struct pmmap_inode *pino;
 	struct inode *inode;
@@ -250,9 +251,9 @@ __pmmap_get_inode(struct pmmap_create_inode_data *cd)
 	}
 	
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(5,15,0)
-	inode_init_owner(inode, dir, cd->mode);
+	inode_init_owner(inode, cd->dir, cd->mode);
 #else
-	inode_init_owner(&init_user_ns, inode, dir, cd->mode);
+	inode_init_owner(&init_user_ns, inode, cd->dir, cd->mode);
 #endif
 	inode->i_blocks = 0;
 	if (cd->replay) {
@@ -282,10 +283,12 @@ __pmmap_get_inode(struct pmmap_create_inode_data *cd)
 	pino = PMMAP_I(inode);
 	pino->admin = !!test_bit(PMMAP_SUPER_FLAGS_ADMIN, &ps->flags);
 	/*
-	 * dir could be NULL here when we create root inode
-	 */
-	if (dir)
-		pino->flags |= PMMAP_I(dir)->flags & PMMAP_INODE_FLAG_ADIR_MASK;
+	 * dir could be NULL here when we create root inode. We needn't to
+	 * care about the reference because the directory cannot be removed
+	 * when it still has children.
+	*/
+	if (pdir && pdir->adir)
+		pino->adir = pdir->adir;
 
 	return inode;
 }
@@ -770,19 +773,91 @@ const struct inode_operations pmmap_tmp_dir_inode_operations = {
 	.rename		= pmmap_tmp_rename,
 };
 
+static struct pmmap_adir *pmmap_alloc_init_adir(struct pmmap_inode *pino,
+		int order)
+{
+	struct pmmap_super *ps = PMMAP_SB(pino->vfs_inode.i_sb);
+	struct pmmap_adir *adir;
+
+	adir = kmalloc(sizeof(struct pmmap_adir), GFP_KERNEL);
+	if (!adir)
+		return NULL;
+
+	adir->chunk_order = order;
+	adir->nr_chunks = 0;
+	adir->free_blks = 0;
+	adir->pino = pino;
+	mutex_init(&adir->lock);
+	/*
+	 * When adir sz is PUD, we allocate pud chunks into pmd level.
+	 */
+	adir->pmd.level = PE_SIZE_PMD;
+	adir->pmd.upper = NULL;
+	adir->pmd.ps = ps;
+	adir->pmd.shift = PMD_SHIFT - PAGE_SHIFT;
+	adir->pmd.mask = ~((1 << (PUD_SHIFT - PAGE_SHIFT)) - 1);
+	adir->pmd.free = 0;
+	adir->pmd.ids_per_chunk = PUD_SIZE / PMD_SIZE;
+
+	adir->pmd.rb_root_by_id = RB_ROOT_CACHED;
+	INIT_LIST_HEAD(&adir->pmd.list_by_free);
+	INIT_LIST_HEAD(&adir->pmd.list_all);
+	/*
+	 * When adir sz is PMD, we allocate pmd chunks into pmd level.
+	 */
+	adir->pte.level = PE_SIZE_PTE;
+	if (adir->chunk_order == PMMAP_PUD_ORDER)
+		adir->pte.upper = &adir->pmd;
+	else
+		adir->pte.upper = NULL;
+	adir->pte.ps = ps;
+	adir->pte.shift = 0;
+	adir->pte.mask = ~((1 << adir->pmd.shift) - 1);
+	adir->pte.free = 0;
+	adir->pte.ids_per_chunk = PMD_SIZE / PAGE_SIZE;
+
+	adir->pte.rb_root_by_id = RB_ROOT_CACHED;
+	INIT_LIST_HEAD(&adir->pte.list_by_free);
+	INIT_LIST_HEAD(&adir->pte.list_all);
+
+	return adir;
+}
+
+void pmmap_free_adir(struct pmmap_adir *adir)
+{
+	struct list_head *pos, *next;
+	struct pmmap_chunk *chk;
+
+	mutex_destroy(&adir->lock);
+
+	list_for_each_safe(pos, next, &adir->pmd.list_all) {
+		chk = list_entry(pos, struct pmmap_chunk, list_all_node);
+		kfree(chk);
+	}
+
+	list_for_each_safe(pos, next, &adir->pte.list_all) {
+		chk = list_entry(pos, struct pmmap_chunk, list_all_node);
+		kfree(chk);
+	}
+
+	kfree(adir);
+}
+
 static long pmmap_set_adir(struct inode *inode, unsigned int sz)
 {
 	struct pmmap_super *ps = PMMAP_SB(inode->i_sb);
 	struct pmmap_inode *pino = PMMAP_I(inode);
 	struct pmmap_log_cursor lcur;
-	int flag, err;
+	int flag, order, err;
 
 	switch (sz) {
 	case PMMAP_ADIR_SZ_PMD:
 		flag = PMMAP_INODE_FLAG_ADIR_PMD;
+		order = PMMAP_PMD_ORDER;
 		break;
 	case PMMAP_ADIR_SZ_PUD:
 		flag = PMMAP_INODE_FLAG_ADIR_PUD;
+		order = PMMAP_PUD_ORDER;
 		break;
 	default:
 		flag = 0;
@@ -795,15 +870,17 @@ static long pmmap_set_adir(struct inode *inode, unsigned int sz)
 	}
 
 	inode_lock(inode);
-	if (pino->flags & PMMAP_INODE_FLAG_ADIR_MASK) {
+	if (IS_ADIR(pino)) {
 		err = -EBUSY;
 		goto out_unlock;
 	}
-	/*
-	 * After set this flag, all of new created file in the future
-	 * will inherit this flags
-	 * TODO: Record this in log
-	 */
+
+	pino->adir = pmmap_alloc_init_adir(pino, order);
+	if (!pino->adir) {
+		err = -ENOMEM;
+		goto out_unlock;
+	}
+
 	pino->flags |= flag;
 	if (ps->durable) {
 		err = pmmap_log_start(&lcur, ps, PMMAP_INODE, pino->admin);
@@ -817,6 +894,7 @@ static long pmmap_set_adir(struct inode *inode, unsigned int sz)
 		pmmap_log_record_inode(&lcur, inode);
 		pmmap_log_finish(&lcur, true);
 	}
+
 	err = 0;
 out_unlock:
 	inode_unlock(inode);
@@ -824,19 +902,25 @@ out:
 	return err;
 }
 
-static void pmmap_get_adir(struct inode *inode, unsigned int __user *addr)
+static void pmmap_get_adir(struct inode *inode, struct pmmap_ioc_adir __user *info)
 {
 	struct pmmap_inode *pino = PMMAP_I(inode);
-	unsigned int sz;
 
-	if (pino->flags & PMMAP_INODE_FLAG_ADIR_PMD)
-		sz = PMMAP_ADIR_SZ_PMD;
-	else if (pino->flags & PMMAP_INODE_FLAG_ADIR_PUD)
-		sz = PMMAP_ADIR_SZ_PUD;
-	else
-		sz = PMMAP_ADIR_SZ_NONE;
+	if (pino->adir) {
+		if (pino->adir->chunk_order == PMMAP_PUD_ORDER)
+			put_user(PMMAP_ADIR_SZ_PUD, &info->chk_sz);
+		else
+			put_user(PMMAP_ADIR_SZ_PMD, &info->chk_sz);
 
-	put_user(sz, addr);
+		if (IS_ADIR(pino))
+			put_user(1, &info->master);
+		else
+			put_user(0, &info->master);
+		put_user(pino->adir->nr_chunks, &info->nr_chks);
+		put_user(pino->adir->free_blks, &info->free_blks);
+	} else {
+		put_user(PMMAP_ADIR_SZ_NONE, &info->chk_sz);
+	}
 }
 
 static long pmmap_file_ioctl(struct file *filp,	unsigned int cmd, unsigned long	arg)

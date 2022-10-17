@@ -382,6 +382,7 @@ static int __pmmap_bmap_write(struct pmmap_bmap_cur *bcur,
 	 * Do allocation for the bmap WRITE
 	 */
 	acur.ps = ps;
+	acur.adir = bcur->adir;
 	acur.tgt_bg = pino->prev_alloc_bg;
 	acur.res_count = 0;
 	acur.batch = bcur->extent.len >> PAGE_SHIFT;
@@ -461,6 +462,25 @@ int pmmap_bmap_write(struct pmmap_bmap_cur *bcur)
 			break;
 		}
 
+		/*
+		 * Only order 0 blocks are allocated from adir
+		 */
+		if (pino->adir && !bcur->order)
+			bcur->adir = pino->adir;
+		else
+			bcur->adir = NULL;
+
+		if (bcur->adir) {
+			PDBG("adir alloc %llu blks\n", bcur->extent.len >> PAGE_SHIFT);
+			mutex_lock(&bcur->adir->lock);
+			if (!pmmap_adir_check_space(ps, bcur->adir,
+						bcur->extent.len >> PAGE_SHIFT)) {
+				ret = -ENOSPC;
+				mutex_unlock(&bcur->adir->lock);
+				break;		
+			}
+		}
+	
 		if (ps->durable) {
 			struct pmmap_log_cursor lcur;
 
@@ -473,6 +493,10 @@ int pmmap_bmap_write(struct pmmap_bmap_cur *bcur)
 		} else {
 			ret = __pmmap_bmap_write(bcur, NULL);
 		}
+
+		if (bcur->adir)
+			mutex_unlock(&bcur->adir->lock);
+	
 		if (ret)
 			break;
 	}
@@ -568,6 +592,10 @@ void pmmap_bmap_erase(struct pmmap_bmap_cur *bcur)
 	struct pmmap_bmap_iter_data id;
 
 	dcur.ps = ps;
+	if (pino->adir && !IS_ADIR(pino))
+		dcur.adir = pino->adir;
+	else
+		dcur.adir = NULL;
 	dcur.df = NULL;
 	/*
 	 * The truncate would be roundup to block size

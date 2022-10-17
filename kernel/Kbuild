@@ -1,4 +1,5 @@
 obj-m += pmmap.o
+ccflags-y += -g
 pmmap-y := super.o bmap.o inode.o alloc.o meta.o common.o ctl.o
 
 

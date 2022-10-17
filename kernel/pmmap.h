@@ -39,6 +39,12 @@ struct pmmap_super;
 #define PWARN(fmt, ...) pr_warn("%s: " fmt, __func__, ##__VA_ARGS__)
 #define PWARN_LIMIT(fmt, ...) printk_ratelimited(KERN_WARNING "%s: " fmt, __func__, ##__VA_ARGS__)
 
+#if 1
+	#define PMSG(fmt, ...) pr_info("%s: " fmt, __func__, ##__VA_ARGS__)
+#else
+	#define PMSG(fmt, ...)
+#endif
+
 #ifdef PMMAP_DEBUG
 	#define PDBG(fmt, ...) trace_printk(fmt, ##__VA_ARGS__)
 #else
@@ -60,13 +66,16 @@ enum {
 	PMMAP_INODE_FLAG_ADIR_PUD = 1 << 1,
 };
 
-#define PMMAP_INODE_FLAG_ADIR_MASK (PMMAP_INODE_FLAG_ADIR_PMD | PMMAP_INODE_FLAG_ADIR_PUD)
+#define IS_ADIR(pino) (pino->flags & (PMMAP_INODE_FLAG_ADIR_PMD | PMMAP_INODE_FLAG_ADIR_PUD))
+
+struct pmmap_adir;
 
 struct pmmap_inode {
 	struct inode vfs_inode;
 	struct rw_semaphore	mmap_rwsem;
 	struct rw_semaphore	bmap_rwsem;
 	struct xarray dax_mapping;
+	struct pmmap_adir *adir;
 	struct rb_node rb_node;
 	struct list_head list_node;
 	unsigned long max_index;
@@ -139,6 +148,16 @@ struct pmmap_level {
 	 */
 	struct pmmap_level *upper;
 	struct pmmap_super *ps;
+};
+
+struct pmmap_adir {
+	int chunk_order;
+	u32 nr_chunks;
+	u64 free_blks;
+	struct pmmap_inode *pino;
+	struct pmmap_level pmd;
+	struct pmmap_level pte;
+	struct mutex lock;
 };
 
 #define PMMAP_MAX_PUD_PER_BG 256
@@ -316,6 +335,7 @@ enum pmmap_alloc_res {
 
 struct pmmap_alloc_cursor {
 	struct pmmap_super *ps;
+	struct pmmap_adir *adir;
 	int tgt_bg;
 	int batch;
 	int order;
@@ -333,7 +353,7 @@ struct pmmap_alloc_data {
 
 static inline struct pmmap_inode *PMMAP_I(struct inode *inode)
 {
-	return container_of(inode, struct pmmap_inode, vfs_inode);
+	return inode ? container_of(inode, struct pmmap_inode, vfs_inode) : NULL;
 }
 
 static inline struct pmmap_super *PMMAP_SB(struct super_block *sb)
@@ -359,6 +379,7 @@ struct pmmap_bmap_cur {
 	} extent;
 	u16 map_type;
 	int order;
+	struct pmmap_adir *adir;
 };
 
 struct pmmap_bmap_iter_data {
@@ -390,6 +411,7 @@ struct pmmap_defer_free {
 
 struct pmmap_defer_free_cur {
 	struct pmmap_super *ps;
+	struct pmmap_adir *adir;
 	struct pmmap_defer_free *df;
 };
 
@@ -427,6 +449,7 @@ int pmmap_symlink_inode(struct inode *dir,
 		u32 tsec, u64 ino);
 
 int pmmap_mknod(struct inode *dir, struct dentry *dentry, umode_t mode, dev_t dev);
+void pmmap_free_adir(struct pmmap_adir *adir);
 
 void pmmap_free_level(struct pmmap_alloc_data *ad);
 int pmmap_reserve_level(struct pmmap_alloc_data *ad);
@@ -434,6 +457,8 @@ bool pmmap_new_blk(struct pmmap_alloc_cursor *cur);
 void pmmap_free_blk(struct pmmap_super *ps, int order, u64 dblk, u32 nr);
 int pmmap_alloc_init(struct pmmap_super *ps);
 void pmmap_alloc_exit(struct pmmap_super *ps);
+bool pmmap_adir_check_space(struct pmmap_super *ps,
+		struct pmmap_adir *adir, u64 cnt);
 
 int pmmap_install_blks(struct pmmap_inode *dno,
 		u64 start_index, u64 dblk, u64 len, int order);

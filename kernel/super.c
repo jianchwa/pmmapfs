@@ -344,8 +344,14 @@ static struct inode *pmmap_alloc_inode(struct super_block *sb)
 static void pmmap_destroy_callback(struct rcu_head *head)
 {
 	struct inode *inode = container_of(head, struct inode, i_rcu);
+	struct pmmap_inode *pino = PMMAP_I(inode);
+
 	if (S_ISLNK(inode->i_mode))
 		kfree(inode->i_link);
+
+	if (IS_ADIR(pino) && pino->adir)
+		pmmap_free_adir(pino->adir);
+
 	kmem_cache_free(pmmap_inode_cachep, PMMAP_I(inode));
 }
 

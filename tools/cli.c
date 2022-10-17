@@ -267,7 +267,6 @@ static int do_ioctl(const char *name, unsigned int cmd, void *arg)
 
 static int do_adir_dir(void)
 {
-	unsigned int sz = Conf.adir.sz;
 	struct stat st;
 	int err;
 
@@ -282,21 +281,21 @@ static int do_adir_dir(void)
 			return -EINVAL;
 		}
 
-		err = do_ioctl(Conf.adir.name, PMMAP_IOC_SET_ADIR, (void *)(unsigned long)sz);
+		err = do_ioctl(Conf.adir.name, PMMAP_IOC_SET_ADIR,
+				(void *)(unsigned long)Conf.adir.sz);
 		if (err)
 			ERR("Set adir(%s) on directory %s failed\n",
 					Conf.adir.sz == PMMAP_ADIR_SZ_PMD ? "pmd" : "pud",
 					Conf.adir.name);
 	} else {
-		err = do_ioctl(Conf.adir.name, PMMAP_IOC_GET_ADIR, &sz);
+		struct pmmap_ioc_adir adir;
+
+		err = do_ioctl(Conf.adir.name, PMMAP_IOC_GET_ADIR, &adir);
 		if (err) {
 			ERR("Get adir on directory %s failed\n", Conf.adir.name);
 		} else {
 			const char *str;
-			switch (sz) {
-			case PMMAP_ADIR_SZ_NONE:
-				str = "none";
-				break;
+			switch (adir.chk_sz) {
 			case PMMAP_ADIR_SZ_PMD:
 				str = "pmd";
 				break;
@@ -304,10 +303,16 @@ static int do_adir_dir(void)
 				str = "pud";
 				break;
 			default:
-				str = "invalid";
+				str = NULL;
 				break;
 			}
-			printf("%s\n", str);
+
+			if (!str)
+				printf("none\n");
+			else if (adir.master)
+				printf("master %s chks %u free_blks %llu\n", str, adir.nr_chks, adir.free_blks);
+			else
+				printf("slave %s\n", str);
 		}
 	}
 
