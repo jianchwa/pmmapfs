@@ -6,6 +6,7 @@
 #include "ctl.h"
 
 const struct file_operations pmmap_file_dax_operations;
+const struct file_operations pmmap_adir_dax_operations;
 const struct address_space_operations pmmap_aops;
 
 static bool inline is_admin(struct dentry *den)
@@ -287,8 +288,11 @@ __pmmap_get_inode(struct pmmap_create_inode_data *cd)
 	 * care about the reference because the directory cannot be removed
 	 * when it still has children.
 	*/
-	if (pdir && pdir->adir)
+	if (pdir && pdir->adir) {
 		pino->adir = pdir->adir;
+		if (S_ISREG(inode->i_mode))
+			inode->i_fop = &pmmap_adir_dax_operations;
+	}
 
 	return inode;
 }
@@ -1474,7 +1478,6 @@ static unsigned long pmmap_get_unmapped_area(struct file *filp,
 				      unsigned long addr, unsigned long len,
 				      unsigned long pgoff, unsigned long flags)
 {
-
 	unsigned long len_pad;
 	unsigned long size;
 
@@ -1500,6 +1503,52 @@ static unsigned long pmmap_get_unmapped_area(struct file *filp,
 
 out:
 	return current->mm->get_unmapped_area(filp, addr, len, pgoff, flags);
+}
+
+static unsigned long pmmap_adir_get_unmapped_area(struct file *filp,
+				      unsigned long addr, unsigned long len,
+				      unsigned long pgoff, unsigned long flags)
+{
+	struct pmmap_inode *pino = PMMAP_I(file_inode(filp));
+	struct pmmap_adir *adir = pino->adir;
+	struct pmmap_bmap_cur bcur = { 0 };
+	unsigned long len_pad;
+	unsigned long size, offset;
+
+	if (!adir)
+		return pmmap_get_unmapped_area(filp, addr, len, pgoff, flags);
+	/*
+	 * Don't specify mapping address for adir files
+	 */
+	if (addr)
+		return -EINVAL;
+
+	if (adir->chunk_order == PMMAP_PUD_ORDER)
+		size = PUD_SIZE;
+	else
+		size = PMD_SIZE;
+
+	len = size + 1;
+	len_pad = __get_len_pad(0, len, size);
+	if (!len_pad)
+		return -ENOMEM;
+
+	addr = current->mm->get_unmapped_area(filp, 0, len_pad, 0, flags);
+	if (IS_ERR_VALUE(addr))
+		return addr;
+
+	/*
+	 * Get the offset of file in adir chunk
+	 */
+	bcur.inode = file_inode(filp);
+	bcur.file.off = pgoff << PAGE_SHIFT;
+	bcur.file.len = len;
+
+	pmmap_bmap_write(&bcur);
+	offset = bcur.extent.d_off & (size - 1);
+
+	PMSG("addr %lx offset %lu\n", addr, offset);
+	return addr + offset;
 }
 
 static int __pmmap_sync_time(struct inode *inode)
@@ -1561,6 +1610,23 @@ const struct file_operations pmmap_file_dax_operations = {
 	.compat_ioctl	= pmmap_compat_file_ioctl,
 #endif
 };
+
+const struct file_operations pmmap_adir_dax_operations = {
+	.fallocate = pmmap_file_dax_fallocate,
+	.mmap 		= pmmap_file_dax_mmap,
+	.get_unmapped_area = pmmap_adir_get_unmapped_area,
+	.llseek		= pmmap_file_dax_llseek,
+	.read_iter	= pmmap_file_dax_read_iter,
+	.write_iter	= pmmap_file_dax_write_iter,
+	.fsync		= pmmap_file_dax_fsync,
+	.splice_read	= generic_file_splice_read,
+	.splice_write	= iter_file_splice_write,
+	.unlocked_ioctl = pmmap_file_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl	= pmmap_compat_file_ioctl,
+#endif
+};
+
 
 static int pmmap_dax_writepages(struct address_space *mapping,
 		struct writeback_control *wbc)

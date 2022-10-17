@@ -186,6 +186,21 @@ static inline u64 decide_end_index(u64 start_index, u64 end_index)
 	return end_index;
 }
 
+static inline void convert_to_adir_chunk(struct pmmap_bmap_cur *bcur)
+{
+	struct pmmap_inode *pino = PMMAP_I(bcur->inode);
+	struct pmmap_adir *adir = pino->adir;
+	unsigned long size;
+
+	if (!adir || bcur->map_type != IOMAP_MAPPED)
+		return;
+
+	size = 1 << (adir->chunk_order + PAGE_SHIFT);
+	bcur->extent.f_off = round_down(bcur->extent.f_off, size);
+	bcur->extent.d_off = bcur->extent.d_off & (size - 1);
+	bcur->extent.len = size;
+}
+
 static int __pmmap_bmap_read(struct pmmap_bmap_cur *bcur)
 {
 	struct pmmap_super *ps = PMMAP_SB(bcur->inode->i_sb);
@@ -261,7 +276,10 @@ static int __pmmap_bmap_read(struct pmmap_bmap_cur *bcur)
 		bcur->order = 0;
 	}
 	rcu_read_unlock();
-	PDBG("get index (%llu, %llu) maptype %s\n",
+
+	convert_to_adir_chunk(bcur);
+
+	PMSG("get index (%llu, %llu) maptype %s\n",
 			bcur->extent.f_off >> PAGE_SHIFT,
 			bcur->extent.len >> PAGE_SHIFT,
 			bcur->map_type == IOMAP_MAPPED ? "mapped" : "hole");
