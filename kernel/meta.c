@@ -398,6 +398,7 @@ static void pmmap_sync_inode(struct pmmap_meta_cursor *mcur,
 	nv_inode.atime = cpu_to_le32(inode->i_atime.tv_sec);
 	nv_inode.ctime = cpu_to_le32(inode->i_ctime.tv_sec);
 	nv_inode.mtime = cpu_to_le32(inode->i_mtime.tv_sec);
+	nv_inode.pflags = cpu_to_le32(pino->flags);
 	PDBG("ino %lu mode %x atime %x ctime %x\n",
 			inode->i_ino, inode->i_mode,
 			(u32)inode->i_atime.tv_sec,
@@ -705,6 +706,7 @@ static int pmmap_load_dentries(
 static void pmmap_fill_inode_from_meta(struct inode *inode,
 		struct pmmap_nv_inode *nv_inode)
 {
+	struct pmmap_inode *pino = PMMAP_I(inode);
 	int flags;
 
 	inode->i_ino = le64_to_cpu(nv_inode->ino);
@@ -720,6 +722,7 @@ static void pmmap_fill_inode_from_meta(struct inode *inode,
 	if (!S_ISDIR(inode->i_mode))
 		inode->i_size = le64_to_cpu(nv_inode->size);
 
+	pino->flags = le32_to_cpu(nv_inode->pflags);
 	/*
 	 * inode has been added to LOOKUP when create empty inode
 	 */
@@ -1093,6 +1096,10 @@ void pmmap_log_module_init(void )
 
 	opcode_to_len[PMMAP_SIZE] = round_up(rec +
 			sizeof(struct pmmap_log_size), 64);
+
+	opcode_to_len[PMMAP_INODE] = round_up(rec +
+			sizeof(struct pmmap_log_inode), 64);
+
 }
 
 int pmmap_log_start(struct pmmap_log_cursor *lcur,
@@ -1341,6 +1348,16 @@ void pmmap_log_record_setattr(struct pmmap_log_cursor *lcur,
 	sa->ctime = cpu_to_le32(attr->ia_ctime.tv_sec);
 
 	lcur->fin_len += sizeof(*sa);
+}
+
+void pmmap_log_record_inode(struct pmmap_log_cursor *lcur,
+		struct inode *inode)
+{
+	struct pmmap_log_inode *ino = log_body(lcur);
+	struct pmmap_inode *pino = PMMAP_I(inode);
+
+	lcur->ino = inode->i_ino;
+	ino->flags = cpu_to_le32(pino->flags);
 }
 
 static struct dentry *__lookup_dentry(struct inode *dir,
@@ -1750,6 +1767,30 @@ error:
 	return -ENOENT;
 }
 
+static int log_replay_inode(struct pmmap_super *ps,
+		struct pmmap_log_record *rec)
+{
+	struct pmmap_log_inode *ino = log_body2(rec);
+	struct pmmap_inode *pino;
+	struct inode *inode;
+	const char *err;
+
+	inode = pmmap_lookup_inode(ps, le64_to_cpu(rec->ino));
+	if (!inode) {
+		err = "no inode";
+		goto error;
+	}
+
+	pino = PMMAP_I(inode);
+	pino->flags = le32_to_cpu(ino->flags);
+
+	return 0;
+error:
+	PERR("modify inode %llu failed(%s)\n",
+			le64_to_cpu(rec->ino), err);
+	return -ENOENT;
+}
+
 static bool __log_record_stop(struct pmmap_log_record *rec, u64 ver)
 {
 	u16 opcode, len;
@@ -1851,6 +1892,9 @@ static int pmmap_log_replay(struct pmmap_meta_context *mc)
 			break;
 		case PMMAP_SIZE:
 			ret = log_replay_size(ps, rec);
+			break;
+		case PMMAP_INODE:
+			ret = log_replay_inode(ps, rec);
 			break;
 		default:
 			break;

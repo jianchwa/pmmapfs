@@ -3,6 +3,7 @@
  * Copyright (C) 2021 Wang Jianchao
  */
 #include "pmmap.h"
+#include "ctl.h"
 
 const struct file_operations pmmap_file_dax_operations;
 const struct address_space_operations pmmap_aops;
@@ -56,6 +57,7 @@ void pmmap_init_inode(struct inode *inode)
 	pino->prev_alloc_bg = -1;
 	pino->empty = true;
 	pino->admin = false;
+	pino->flags = 0;
 	init_rwsem(&pino->mmap_rwsem);
 	init_rwsem(&pino->bmap_rwsem);
 	xa_init(&pino->dax_mapping);
@@ -227,6 +229,7 @@ __pmmap_get_inode(struct pmmap_create_inode_data *cd)
 	struct super_block *sb = cd->sb;
 	struct inode *dir = cd->dir;
 	struct pmmap_super *ps = PMMAP_SB(sb);
+	struct pmmap_inode *pino;
 	struct inode *inode;
 
 	if (!pmmap_reserve_inode_nr(sb))
@@ -275,7 +278,14 @@ __pmmap_get_inode(struct pmmap_create_inode_data *cd)
 		break;
 	}
 	pmmap_arm_inode(inode);
-	PMMAP_I(inode)->admin = !!test_bit(PMMAP_SUPER_FLAGS_ADMIN, &ps->flags);
+
+	pino = PMMAP_I(inode);
+	pino->admin = !!test_bit(PMMAP_SUPER_FLAGS_ADMIN, &ps->flags);
+	/*
+	 * dir could be NULL here when we create root inode
+	 */
+	if (dir)
+		pino->flags |= PMMAP_I(dir)->flags & PMMAP_INODE_FLAG_ADIR_MASK;
 
 	return inode;
 }
@@ -760,6 +770,119 @@ const struct inode_operations pmmap_tmp_dir_inode_operations = {
 	.rename		= pmmap_tmp_rename,
 };
 
+static long pmmap_set_adir(struct inode *inode, unsigned int sz)
+{
+	struct pmmap_super *ps = PMMAP_SB(inode->i_sb);
+	struct pmmap_inode *pino = PMMAP_I(inode);
+	struct pmmap_log_cursor lcur;
+	int flag, err;
+
+	switch (sz) {
+	case PMMAP_ADIR_SZ_PMD:
+		flag = PMMAP_INODE_FLAG_ADIR_PMD;
+		break;
+	case PMMAP_ADIR_SZ_PUD:
+		flag = PMMAP_INODE_FLAG_ADIR_PUD;
+		break;
+	default:
+		flag = 0;
+		break;
+	}
+
+	if (!flag) {
+		err = -EINVAL;
+		goto out;
+	}
+
+	inode_lock(inode);
+	if (pino->flags & PMMAP_INODE_FLAG_ADIR_MASK) {
+		err = -EBUSY;
+		goto out_unlock;
+	}
+	/*
+	 * After set this flag, all of new created file in the future
+	 * will inherit this flags
+	 * TODO: Record this in log
+	 */
+	pino->flags |= flag;
+	if (ps->durable) {
+		err = pmmap_log_start(&lcur, ps, PMMAP_INODE, pino->admin);
+		if (err) {
+			/*
+			 * Revert the modification
+			 */
+			pino->flags &= ~flag;
+			goto out_unlock;
+		}
+		pmmap_log_record_inode(&lcur, inode);
+		pmmap_log_finish(&lcur, true);
+	}
+	err = 0;
+out_unlock:
+	inode_unlock(inode);
+out:
+	return err;
+}
+
+static void pmmap_get_adir(struct inode *inode, unsigned int __user *addr)
+{
+	struct pmmap_inode *pino = PMMAP_I(inode);
+	unsigned int sz;
+
+	if (pino->flags & PMMAP_INODE_FLAG_ADIR_PMD)
+		sz = PMMAP_ADIR_SZ_PMD;
+	else if (pino->flags & PMMAP_INODE_FLAG_ADIR_PUD)
+		sz = PMMAP_ADIR_SZ_PUD;
+	else
+		sz = PMMAP_ADIR_SZ_NONE;
+
+	put_user(sz, addr);
+}
+
+static long pmmap_file_ioctl(struct file *filp,	unsigned int cmd, unsigned long	arg)
+{
+	struct inode *inode = file_inode(filp);
+	long err;
+
+	switch (cmd) {
+	case PMMAP_IOC_SET_ADIR:
+		if (S_ISDIR(inode->i_mode))
+			err = pmmap_set_adir(inode, (unsigned int)(arg));
+		else
+			err = -EINVAL;
+		break;
+	case PMMAP_IOC_GET_ADIR:
+		pmmap_get_adir(inode, (void *)arg);
+		err = 0;
+		break;
+	default:
+		err = -ENOTTY;
+		break;
+	}
+
+	return err;
+}
+
+#ifdef CONFIG_COMPAT
+static long pmmap_compat_file_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	return pmmap_file_ioctl(file, cmd, (unsigned long)compat_ptr(arg));
+}
+#endif
+
+static struct file_operations pmmap_dir_operations = {
+	.open		= dcache_dir_open,
+	.release	= dcache_dir_close,
+	.llseek		= dcache_dir_lseek,
+	.read		= generic_read_dir,
+	.iterate_shared	= dcache_readdir,
+	.fsync		= noop_fsync,
+	.unlocked_ioctl = pmmap_file_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl	= pmmap_compat_file_ioctl,
+#endif
+};
+
 void pmmap_arm_inode(struct inode *inode)
 {
 	struct pmmap_super *ps = PMMAP_SB(inode->i_sb);
@@ -779,7 +902,7 @@ void pmmap_arm_inode(struct inode *inode)
 			inode->i_op = &pmmap_dir_inode_operations;
 		else
 			inode->i_op = &pmmap_tmp_dir_inode_operations;
-		inode->i_fop = &simple_dir_operations;
+		inode->i_fop = &pmmap_dir_operations;
 		break;
 	case S_IFLNK:
 		if (inode->i_size + 1 <= PMMAP_SHORT_SYMLINK_LEN)
@@ -1349,6 +1472,10 @@ const struct file_operations pmmap_file_dax_operations = {
 	.fsync		= pmmap_file_dax_fsync,
 	.splice_read	= generic_file_splice_read,
 	.splice_write	= iter_file_splice_write,
+	.unlocked_ioctl = pmmap_file_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl	= pmmap_compat_file_ioctl,
+#endif
 };
 
 static int pmmap_dax_writepages(struct address_space *mapping,

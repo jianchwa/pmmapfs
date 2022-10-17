@@ -70,6 +70,8 @@ struct pmmap_nv_inode {
 	__le32 atime;	/* Access time */
 	__le32 ctime;	/* Creation time */
 	__le32 mtime;	/* Modification time */
+
+	__le32 pflags; 	/* Pmmap specific inode flags */
 };
 
 enum {
@@ -111,6 +113,7 @@ enum {
 	PMMAP_INSTALL,
 	PMMAP_SETATTR,
 	PMMAP_SIZE,
+	PMMAP_INODE, /* Used to record some pmmap_inode changes */
 	PMMAP_OP_MAX,
 };
 
@@ -201,6 +204,11 @@ struct pmmap_log_setattr {
 	__le32 atime;
 	__le32 mtime;
 	__le32 ctime;
+	__le32 pflags;
+} __attribute__ ((__packed__));
+
+struct pmmap_log_inode {
+	__le32 flags;
 } __attribute__ ((__packed__));
 
 #define PMMAP_LOG_REF_FLUSH (0x80000000)
@@ -286,6 +294,7 @@ void pmmap_log_record_size(struct pmmap_log_cursor *lcur,
 		struct inode *inode);
 void pmmap_log_record_setattr(struct pmmap_log_cursor *lcur,
 		struct inode *inode, struct iattr *attr);
+void pmmap_log_record_inode(struct pmmap_log_cursor *lcur, struct inode *inode);
 void pmmap_sync_all_meta(struct pmmap_super *ps);
 void pmmap_log_module_init(void);
 bool pmmap_load_super(struct pmmap_super *ps);

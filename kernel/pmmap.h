@@ -55,6 +55,13 @@ struct pmmap_super;
 #define BOGO_DIRENT_SIZE 20
 #define PMMAP_ADMIN_DIR_INO 2
 
+enum {
+	PMMAP_INODE_FLAG_ADIR_PMD = 1 << 0,
+	PMMAP_INODE_FLAG_ADIR_PUD = 1 << 1,
+};
+
+#define PMMAP_INODE_FLAG_ADIR_MASK (PMMAP_INODE_FLAG_ADIR_PMD | PMMAP_INODE_FLAG_ADIR_PUD)
+
 struct pmmap_inode {
 	struct inode vfs_inode;
 	struct rw_semaphore	mmap_rwsem;
@@ -66,6 +73,7 @@ struct pmmap_inode {
 	int prev_alloc_bg;
 	bool empty;
 	bool admin;
+	unsigned int flags;
 };
 
 enum {

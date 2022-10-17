@@ -18,6 +18,7 @@
 
 enum pmmap_cli_type {
 	PMMAP_CLI_MKFS,
+	PMMAP_CLI_ADIR,
 	PMMAP_CLI_MAX,
 };
 
@@ -29,6 +30,11 @@ struct {
 			long bg_size;
 			int log_len;
 		} mkfs;
+
+		struct {
+			const char *name;
+			unsigned sz;
+		} adir;
 	};
 } Conf;
 
@@ -38,15 +44,19 @@ enum {
 	OP_BDEVNAME,
 	OP_BG_SIZE,
 	OP_LOG_LEN,
+	OP_NAME,
+	OP_SZ,
 	OP_MAX,
 };
 
 static char *options_help[OP_MAX] = {
 	"Show help page",
-	"Command: mkfs",
+	"Command: mkfs, adir",
 	"mkfs - Device name (pmemX)",
 	"mkfs - Block group size (in GiB, 16 by default)",
-	"mkfs - Log length ( in MiB, 128 by default)"
+	"mkfs - Log length ( in MiB, 128 by default)",
+	"adir - File name",
+	"adir - Aggregated chunk size (pud, pmd), set adir if provide asz, get adir if not",
 };
 
 static struct option long_options[] = {
@@ -55,6 +65,8 @@ static struct option long_options[] = {
 	{"bdev", required_argument, 0, OP_BDEVNAME},
 	{"bgsz", required_argument, 0, OP_BG_SIZE},
 	{"log", required_argument, 0, OP_LOG_LEN},
+	{"name", required_argument, 0, OP_NAME},
+	{"sz", required_argument, 0, OP_SZ},
 	{0, 0, 0, 0},
 };
 
@@ -62,7 +74,7 @@ static void help(void)
 {
 	int i;
 
-	printf("pmmap_ctl:\n");
+	printf("pmmap_cli:\n");
 	for (i = 0; i < OP_MAX; i++) {
 		printf("--%-10s %s\n", long_options[i].name,
 				options_help[long_options[i].val]);
@@ -89,6 +101,9 @@ static void parse_options(int argc, char *argv[])
 					Conf.type = type = PMMAP_CLI_MKFS;
 					Conf.mkfs.log_len = 129;
 					Conf.mkfs.bg_size = 16;
+				} else if (!strcmp(optarg, "adir")) {
+					Conf.type = type = PMMAP_CLI_ADIR;
+					Conf.adir.sz = 0;
 				}
 				break;
 			default:
@@ -110,6 +125,23 @@ static void parse_options(int argc, char *argv[])
 			default:
 				help();
 				break;
+			}
+			break;
+		case PMMAP_CLI_ADIR:
+			switch (op) {
+			case OP_NAME:
+				Conf.adir.name = optarg;
+				break;
+			case OP_SZ:
+				if (!strcmp(optarg, "pmd"))
+					Conf.adir.sz = PMMAP_ADIR_SZ_PMD;
+				else if (!strcmp(optarg, "pud"))
+					Conf.adir.sz = PMMAP_ADIR_SZ_PUD;
+				else
+					help();
+				break;
+			default:
+				help();
 			}
 			break;
 		default:
@@ -211,6 +243,77 @@ static int do_mkfs(void)
 	return err;
 }
 
+static int do_ioctl(const char *name, unsigned int cmd, void *arg)
+{
+	int fd, err;
+
+	fd = open(name,  O_RDONLY);
+	if (fd < 0) {
+		err = errno;
+		ERR("Open %s failed due to %s\n", name, strerror(err));
+		return err;
+	}
+
+	err = ioctl(fd, cmd, arg);
+	if (err < 0) {
+		err = errno;
+		ERR("ioctl %x failed due to %d %s\n", cmd, err, strerror(err));
+	}
+
+	close(fd);
+
+	return err;
+}
+
+static int do_adir_dir(void)
+{
+	unsigned int sz = Conf.adir.sz;
+	struct stat st;
+	int err;
+
+	if (lstat(Conf.adir.name, &st)) {
+		ERR("%s is not existed\n", Conf.adir.name);
+		return -EINVAL;
+	}
+
+	if (Conf.adir.sz) {
+		if ((st.st_mode & S_IFMT) != S_IFDIR) {
+			ERR("%s is not directory\n", Conf.adir.name);
+			return -EINVAL;
+		}
+
+		err = do_ioctl(Conf.adir.name, PMMAP_IOC_SET_ADIR, (void *)(unsigned long)sz);
+		if (err)
+			ERR("Set adir(%s) on directory %s failed\n",
+					Conf.adir.sz == PMMAP_ADIR_SZ_PMD ? "pmd" : "pud",
+					Conf.adir.name);
+	} else {
+		err = do_ioctl(Conf.adir.name, PMMAP_IOC_GET_ADIR, &sz);
+		if (err) {
+			ERR("Get adir on directory %s failed\n", Conf.adir.name);
+		} else {
+			const char *str;
+			switch (sz) {
+			case PMMAP_ADIR_SZ_NONE:
+				str = "none";
+				break;
+			case PMMAP_ADIR_SZ_PMD:
+				str = "pmd";
+				break;
+			case PMMAP_ADIR_SZ_PUD:
+				str = "pud";
+				break;
+			default:
+				str = "invalid";
+				break;
+			}
+			printf("%s\n", str);
+		}
+	}
+
+	return err;
+}
+
 int main(int argc, char *argv[])
 {
 	int ret;
@@ -220,6 +323,9 @@ int main(int argc, char *argv[])
 	switch (Conf.type) {
 	case PMMAP_CLI_MKFS:
 		ret = do_mkfs();
+		break;
+	case PMMAP_CLI_ADIR:
+		ret = do_adir_dir();
 		break;
 	default:
 		help();

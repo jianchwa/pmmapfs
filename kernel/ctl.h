@@ -19,5 +19,14 @@ struct pmmap_ioc_mkfs {
 	__u32 log_len;
 };
 
+enum {
+	PMMAP_ADIR_SZ_NONE,
+	PMMAP_ADIR_SZ_PMD,
+	PMMAP_ADIR_SZ_PUD,
+};
+
 #define PMMAP_IOC_MKFS _IOW(PMMAP_IOCTL_MAGIC, 1, struct pmmap_ioc_mkfs)
+#define PMMAP_IOC_SET_ADIR _IOW(PMMAP_IOCTL_MAGIC, 2, unsigned int)
+#define PMMAP_IOC_GET_ADIR _IOR(PMMAP_IOCTL_MAGIC, 3, unsigned int)
+
 #endif
